@@ -81,12 +81,34 @@ export function parseRateLimitHeaders(headers: Record<string, string>): RateLimi
 }
 
 /**
- * Normalize header keys to lowercase for consistent access
- * HTTP headers are case-insensitive, but object keys are not
+ * Anything we might be handed as "the response headers": a plain record, a
+ * WHATWG `Headers` instance (what @atproto/lex exposes on both `XrpcResponse`
+ * and `XrpcResponseError`), or nothing at all.
  */
-export function normalizeHeaders(headers: Record<string, string>): Record<string, string> {
+export type HeadersLike =
+  | Record<string, string>
+  | { forEach(callback: (value: string, key: string) => void): void }
+  | null
+  | undefined;
+
+/**
+ * Normalize header keys to lowercase for consistent access.
+ * HTTP headers are case-insensitive, but object keys are not.
+ *
+ * Accepts a `Headers` instance as well as a plain record:
+ * `Object.entries(new Headers())` is empty, so treating one as a record
+ * silently drops every rate-limit header the PDS sent.
+ */
+export function normalizeHeaders(headers: HeadersLike): Record<string, string> {
   const normalized: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers)) {
+  if (!headers) return normalized;
+  if (typeof (headers as { forEach?: unknown }).forEach === 'function') {
+    (headers as { forEach(cb: (value: string, key: string) => void): void }).forEach((value, key) => {
+      normalized[key.toLowerCase()] = value;
+    });
+    return normalized;
+  }
+  for (const [key, value] of Object.entries(headers as Record<string, string>)) {
     normalized[key.toLowerCase()] = value;
   }
   return normalized;

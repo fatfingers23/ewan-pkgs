@@ -3,7 +3,7 @@
  * Tracks quota from response headers and gates requests to stay within limits.
  */
 
-import { normalizeHeaders } from './rate-limit-headers.js';
+import { normalizeHeaders, type HeadersLike } from './rate-limit-headers.js';
 
 interface State {
   limit: number;
@@ -41,7 +41,7 @@ export class RateLimiter {
    *   whichever bucket the server is reporting; omit for reads/other calls
    *   that shouldn't feed the estimate.
    */
-  updateFromHeaders(headers: Record<string, string>, batchSize?: number): void {
+  updateFromHeaders(headers: HeadersLike, batchSize?: number): void {
     const h = normalizeHeaders(headers);
     const get = (k: string) => h[k] ?? h[`x-${k}`] ?? '';
 
@@ -59,16 +59,24 @@ export class RateLimiter {
     const now = Math.floor(Date.now() / 1000);
     const resetAt = isNaN(reset) ? now + windowSeconds : reset;
 
+    // A differently-shaped bucket (different limit/window) has different
+    // per-request cost semantics — e.g. the per-IP request bucket charges 1
+    // per call while the repo-write bucket charges 3 per create. An estimate
+    // learned from the old bucket says nothing about the new one, so drop it
+    // rather than blending it into the next sample.
+    const sameBucket =
+      this.state !== null && this.state.limit === limit && this.state.windowSeconds === windowSeconds;
+    if (this.state && !sameBucket) {
+      this.observedPointsPerRecord = null;
+    }
+
     // Only learn from this reading if it's a same-window continuation of the
     // previous one — a window reset (or first-ever reading) makes the delta
-    // meaningless, and a jump to a differently-shaped bucket (different
-    // limit/window) resets our sample rather than corrupting the average.
+    // meaningless.
     if (
       batchSize &&
       batchSize > 0 &&
-      this.state &&
-      this.state.limit === limit &&
-      this.state.windowSeconds === windowSeconds &&
+      sameBucket &&
       this.lastRemaining !== null &&
       this.lastResetAt === resetAt
     ) {
@@ -109,6 +117,17 @@ export class RateLimiter {
     return this.observedPointsPerRecord !== null;
   }
 
+  /**
+   * Forget the empirical points-per-record estimate while keeping the quota
+   * ledger. Call this when the cost of what is being sent changes — e.g.
+   * switching from creates (3 points) to deletes (1 point) — so the next
+   * same-window reading pair re-learns against the new cost instead of
+   * blending it into the old average and over-pacing the cheaper writes.
+   */
+  resetPointsPerRecordEstimate(): void {
+    this.observedPointsPerRecord = null;
+  }
+
   getActualRemaining(): number {
     if (!this.state) return 0;
     if (Math.floor(Date.now() / 1000) >= this.state.resetAt) return this.state.limit;
@@ -124,13 +143,21 @@ export class RateLimiter {
     return this.state !== null && this.state.limit > 0;
   }
 
+  /** Unix seconds at which the current window resets, or null before any reading. */
+  getResetAt(): number | null {
+    return this.state?.resetAt ?? null;
+  }
+
   /**
    * Called when the server returns a 429. Zeroes remaining so the next
-   * `waitForPermit` actually blocks until the window resets.
+   * `waitForPermit` actually blocks until the window resets. When the 429
+   * carried rate-limit headers, `resetAt` comes from them; the one-hour
+   * stub below is only the fallback for a headerless response.
    */
-  handleRateLimitHit(errHeaders?: Record<string, string>): void {
-    if (errHeaders && Object.keys(errHeaders).length > 0) {
-      this.updateFromHeaders(errHeaders);
+  handleRateLimitHit(errHeaders?: HeadersLike): void {
+    const normalized = normalizeHeaders(errHeaders);
+    if (Object.keys(normalized).length > 0) {
+      this.updateFromHeaders(normalized);
     }
     const now = Math.floor(Date.now() / 1000);
     if (this.state) {
@@ -143,8 +170,16 @@ export class RateLimiter {
   /**
    * Wait until there is sufficient quota to send `pointsNeeded` points.
    * Polls `isCancelled` every 50 ms so callers can abort mid-wait.
+   *
+   * @param onWait Invoked once, before blocking, with how long the wait will
+   *   be and the unix-ms time it ends — so callers can tell the user why
+   *   nothing is being sent instead of appearing to hang.
    */
-  async waitForPermit(pointsNeeded: number, isCancelled?: () => boolean): Promise<void> {
+  async waitForPermit(
+    pointsNeeded: number,
+    isCancelled?: () => boolean,
+    onWait?: (waitMs: number, resumeAt: number) => void,
+  ): Promise<void> {
     if (!this.state) return; // no info yet — let first request probe
 
     const now = Math.floor(Date.now() / 1000);
@@ -159,6 +194,7 @@ export class RateLimiter {
     if (effective < pointsNeeded) {
       const resetMs = Math.max(0, (this.state.resetAt - Math.floor(Date.now() / 1000)) + 1) * 1000;
       const end = Date.now() + resetMs;
+      onWait?.(resetMs, end);
       await new Promise<void>((resolve) => {
         const tick = () => {
           if (isCancelled?.() || Date.now() >= end) { resolve(); return; }

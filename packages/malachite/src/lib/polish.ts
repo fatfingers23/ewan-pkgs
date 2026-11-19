@@ -1,17 +1,17 @@
 import type { Client } from '@atproto/lex';
 import type { SingleBar } from 'cli-progress';
 import { RECORD_TYPE, LEGACY_RECORD_TYPE } from '../config.js';
-import { formatDate } from '../utils/helpers.js';
+import { formatDate, formatDuration } from '../utils/helpers.js';
 import * as ui from '../utils/ui.js';
 import { log } from '../utils/logger.js';
 import {
   analyzeLegacyRecords as coreAnalyze,
   migrateLegacyRecords as coreMigrate,
 } from '@ewanc26/croft-click-core';
-import type { PolishPlan, PolishResult } from '@ewanc26/croft-click-core';
+import type { PolishPlan, PolishResult, PolishWait } from '@ewanc26/croft-click-core';
 
 export type { PolishPlan, PolishResult, PolishRecord } from '@ewanc26/croft-click-core';
-export { buildPolishPlan } from '@ewanc26/croft-click-core';
+export { buildPolishPlan, convertLegacyPlay } from '@ewanc26/croft-click-core';
 
 /**
  * Teal migration polish subtool.
@@ -130,8 +130,23 @@ export async function migrateLegacyRecords(
     log.info(`${label}: ${done.toLocaleString()}/${total.toLocaleString()} (${pct}%) — ${elapsed}s elapsed`);
   };
 
+  // Pacing sleeps and quota waits happen inside the core with no output of
+  // their own; without these lines a five-minute pacing sleep or an hour-long
+  // wait for the rate-limit window looks identical to a hang.
+  const PACING_LOG_THRESHOLD_MS = 5000;
+  const onWait = (wait: PolishWait) => {
+    const quota = wait.limit > 0 ? ` (quota ${wait.remaining.toLocaleString()}/${wait.limit.toLocaleString()})` : '';
+    const until = new Date(wait.resumeAt).toLocaleTimeString();
+    if (wait.kind === 'quota') {
+      log.warn(`⏳ Rate limit: ${wait.reason}${quota} — pausing ${formatDuration(wait.ms)} until ${until}`);
+    } else if (wait.ms >= PACING_LOG_THRESHOLD_MS) {
+      log.info(`⏱️  Pacing: sleeping ${formatDuration(wait.ms)} before the next ${wait.phase} batch${quota} — ${wait.reason}`);
+    }
+  };
+
   const result = await coreMigrate(client, plan, {
     dryRun,
+    onWait,
     onProgress: (phase, done, total: number) => {
       if (phase === 'backfill') {
         bars.backfill?.update(done, {});

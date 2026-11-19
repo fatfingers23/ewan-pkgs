@@ -64,7 +64,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getMalachiteStateDir } from './platform.js';
-import { parseRateLimitHeaders, normalizeHeaders } from './rate-limit-headers.js';
+import { parseRateLimitHeaders, normalizeHeaders, type HeadersLike } from './rate-limit-headers.js';
 import { log } from './logger.js';
 
 /**
@@ -377,7 +377,7 @@ export class RateLimiter {
    * 
    * @param headers Response headers from server (should be normalized)
    */
-  updateFromHeaders(headers: Record<string, string>): void {
+  updateFromHeaders(headers: HeadersLike): void {
     const normalizedHeaders = normalizeHeaders(headers);
     const parsed = parseRateLimitHeaders(normalizedHeaders);
     
@@ -696,10 +696,11 @@ export class RateLimiter {
    *
    * @param errHeaders  Optional normalised headers from the 429 error response.
    */
-  handleRateLimitHit(errHeaders?: Record<string, string>): void {
+  handleRateLimitHit(errHeaders?: HeadersLike): void {
     // Apply header info first so resetAt is as accurate as possible.
-    if (errHeaders && Object.keys(errHeaders).length > 0) {
-      this.updateFromHeaders(errHeaders);
+    const normalized = normalizeHeaders(errHeaders);
+    if (Object.keys(normalized).length > 0) {
+      this.updateFromHeaders(normalized);
     }
 
     const now = Math.floor(Date.now() / 1000);

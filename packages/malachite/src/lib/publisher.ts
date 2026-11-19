@@ -2,7 +2,7 @@ import type { Client } from '@atproto/lex'
 import { formatDuration, formatDate } from '../utils/helpers.js';
 import { isImportCancelled } from '../utils/killswitch.js';
 import { RateLimiter } from '../utils/rate-limiter.js';
-import { DynamicBatchCalculator, ProactiveRatePacer, retryWithBackoff, isRetryableError, isRateLimitError, normalizeHeaders, normalizeMusicBrainzId, sanitizePlayRecordMusicBrainzIds } from '@ewanc26/croft-click-core';
+import { DynamicBatchCalculator, ProactiveRatePacer, retryWithBackoff, isRetryableError, isRateLimitError, normalizeHeaders, normalizeMusicBrainzId, sanitizePlayRecordMusicBrainzIds, type HeadersLike } from '@ewanc26/croft-click-core';
 import { formatLocaleNumber } from '../utils/platform.js';
 import { generateTIDFromISO } from '../utils/tid.js';
 import type { PlayRecord, Config, PublishResult } from '../types.js';
@@ -241,13 +241,14 @@ export async function publishRecordsWithApplyWrites(
     await rl.waitForPermit(batchPoints);
 
     try {
-      // Send batch with retry logic for transient failures
-      const response = await retryWithBackoff(
+      // Send batch with retry logic for transient failures.
+      // `client.xrpc`, not `client.call`: `call` returns only the body and
+      // drops the ratelimit-* headers the limiter learns capacity from.
+      const response = (await retryWithBackoff(
         async () => {
-          return await client.call(com.atproto.repo.applyWrites.main as any, {
-            repo: client.assertDid,
-            writes: writes as any,
-          });
+          return await client.xrpc(com.atproto.repo.applyWrites.main as any, {
+            body: { repo: client.assertDid, writes },
+          } as any);
         },
         {
           maxAttempts: 3,
@@ -271,10 +272,10 @@ export async function publishRecordsWithApplyWrites(
             log.info(`⏳ Retrying in ${(delay / 1000).toFixed(1)}s...`);
           },
         }
-      );
+      )) as unknown as { headers?: HeadersLike; body?: { results?: unknown[] } };
 
       // Success!
-      const batchSuccessCount = (response as any).results?.length || batch.length;
+      const batchSuccessCount = response?.body?.results?.length || batch.length;
       successCount += batchSuccessCount;
       const batchDuration = Date.now() - batchStartTime;
       
@@ -286,15 +287,12 @@ export async function publishRecordsWithApplyWrites(
         updateImportState(importState, i + batch.length - 1, batchSuccessCount, 0);
       }
 
-      // Update rate limiter from response headers
+      // Update rate limiter from response headers (a WHATWG Headers instance
+      // from XrpcResponse; normalizeHeaders flattens it to a record)
       try {
-        let respHeaders: Record<string, string> | undefined;
-        if ((response as any)?.headers) {
-          respHeaders = (response as any).headers;
-        }
-        
-        if (respHeaders && Object.keys(respHeaders).length > 0) {
-          const normalized = normalizeHeaders(respHeaders);
+        const normalized = normalizeHeaders(response?.headers);
+
+        if (Object.keys(normalized).length > 0) {
           const hasRateLimitHeaders = Object.keys(normalized).some(k => k.includes('ratelimit'));
           
           if (hasRateLimitHeaders) {
@@ -368,21 +366,14 @@ export async function publishRecordsWithApplyWrites(
       if (rateLimitError) {
         log.warn('⚠️  Rate limit hit — pausing until quota resets…');
 
-        // XRPCError (from @atproto/xrpc) carries response headers directly on
-        // err.headers as a plain Record<string, string> built via
-        // Object.fromEntries(response.headers.entries()), so keys are already
-        // lowercase.  There is no err.response property on this error class.
-        const errHeaders: Record<string, string> | undefined =
-          err?.headers && typeof err.headers === 'object'
-            ? (err.headers as Record<string, string>)
-            : undefined;
-
-        // handleRateLimitHit zeroes remaining unconditionally — this is the
-        // critical fix.  Previously we only called updateFromHeaders when
-        // headers were present, meaning a headerless 429 left state untouched
-        // and waitForPermit returned immediately, sending another request.
+        // XrpcResponseError (from @atproto/lex) exposes the 429's headers on
+        // err.headers as a WHATWG Headers instance; normalizeHeaders handles
+        // that shape as well as a plain record.
+        //
+        // handleRateLimitHit zeroes remaining unconditionally, so a headerless
+        // 429 still blocks the next waitForPermit instead of sending again.
         rl.refund(batchPoints); // this reservation was never actually sent
-        rl.handleRateLimitHit(errHeaders ? normalizeHeaders(errHeaders) : undefined);
+        rl.handleRateLimitHit(err?.headers as HeadersLike);
 
         // Now waitForPermit will block until the window resets.
         await rl.waitForPermit(batchPoints);

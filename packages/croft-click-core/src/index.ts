@@ -27,6 +27,7 @@ export {
   convertListenBrainzToPlayRecord,
 } from './listenbrainz.js';
 export * from './mbid.js';
+export * from './legacy-play.js';
 export * from './merge.js';
 export * from './musicbrainz.js';
 export * from './proactive-rate-pacer.js';

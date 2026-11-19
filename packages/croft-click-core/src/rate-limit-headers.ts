@@ -10,13 +10,34 @@ export interface RateLimitHeaders {
   windowSeconds?: number;
 }
 
-export function normalizeHeaders(headers: Record<string, string>): Record<string, string> {
+/**
+ * Anything we might be handed as "the response headers": a plain record, a
+ * WHATWG `Headers` instance (what @atproto/lex exposes on both `XrpcResponse`
+ * and `XrpcResponseError`), or nothing at all.
+ *
+ * `Headers` matters: `Object.entries(new Headers())` is empty, so treating it
+ * as a record silently drops every rate-limit header the PDS sent.
+ */
+export type HeadersLike =
+  | Record<string, string>
+  | { forEach(callback: (value: string, key: string) => void): void }
+  | null
+  | undefined;
+
+export function normalizeHeaders(headers: HeadersLike): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(headers)) out[k.toLowerCase()] = v;
+  if (!headers) return out;
+  if (typeof (headers as { forEach?: unknown }).forEach === 'function') {
+    (headers as { forEach(cb: (value: string, key: string) => void): void }).forEach((v, k) => {
+      out[k.toLowerCase()] = v;
+    });
+    return out;
+  }
+  for (const [k, v] of Object.entries(headers as Record<string, string>)) out[k.toLowerCase()] = v;
   return out;
 }
 
-export function parseRateLimitHeaders(headers: Record<string, string>): RateLimitHeaders {
+export function parseRateLimitHeaders(headers: HeadersLike): RateLimitHeaders {
   const h = normalizeHeaders(headers);
   const get = (k: string) => h[k] ?? h[`x-${k}`] ?? '';
 

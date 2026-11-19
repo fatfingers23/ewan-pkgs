@@ -17,7 +17,7 @@ import { ProactiveRatePacer } from './proactive-rate-pacer.js';
 import { DynamicBatchCalculator } from './dynamic-batch-calculator.js';
 import { retryWithBackoff } from './retry-helper.js';
 import { generateTIDFromISO } from './tid.js';
-import { normalizeHeaders, isRateLimitError } from './rate-limit-headers.js';
+import { normalizeHeaders, isRateLimitError, type HeadersLike } from './rate-limit-headers.js';
 import { sanitizePlayRecordMusicBrainzIds } from './mbid.js';
 
 export interface PublishProgress {
@@ -46,19 +46,6 @@ function cancellableSleep(ms: number, isCancelled: () => boolean): Promise<void>
     };
     tick();
   });
-}
-
-function extractHeaders(response: unknown): Record<string, string> {
-  const headers: Record<string, string> = {};
-  const r = response as any;
-  if (r?.headers) {
-    if (typeof r.headers.forEach === 'function') {
-      r.headers.forEach((v: string, k: string) => { headers[k] = v; });
-    } else {
-      Object.assign(headers, r.headers);
-    }
-  }
-  return headers;
 }
 
 export async function publishRecords(
@@ -193,11 +180,13 @@ export async function publishRecords(
       const batchStartTime = Date.now();
 
       try {
-        const response = await retryWithBackoff(
-          () => client.call(com.atproto.repo.applyWrites.main as any,
-            { repo: client.assertDid, writes: writes as any },
-            { signal: ac.signal }
-          ),
+        // `client.xrpc`, not `client.call`: `call` returns only the body and
+        // drops the ratelimit-* headers the limiter learns capacity from.
+        const response = (await retryWithBackoff(
+          () => client.xrpc(com.atproto.repo.applyWrites.main as any, {
+            body: { repo: client.assertDid, writes },
+            signal: ac.signal,
+          } as any),
           {
             maxAttempts: 3,
             initialDelayMs: 1000,
@@ -219,10 +208,10 @@ export async function publishRecords(
               onLog('warn', `Batch ${batchCounter} failed (attempt ${attempt}/${maxAttempts}): ${error.message} -- retrying...`);
             },
           }
-        );
+        )) as unknown as { headers?: HeadersLike; body?: { results?: unknown[] } };
 
         // Success!
-        const batchSuccessCount = (response as any).results?.length ?? batch.length;
+        const batchSuccessCount = response?.body?.results?.length ?? batch.length;
         successCount += batchSuccessCount;
         const batchDuration = Date.now() - batchStartTime;
 
@@ -230,9 +219,8 @@ export async function publishRecords(
         calculator.recordSuccess(batch.length, batchDuration);
 
         // Learn / update rate limits from response headers (continuous adaptation)
-        const rawHeaders = extractHeaders(response);
-        if (Object.keys(rawHeaders).length > 0) {
-          const norm = normalizeHeaders(rawHeaders);
+        const norm = normalizeHeaders(response?.headers);
+        if (Object.keys(norm).length > 0) {
           rl.updateFromHeaders(norm, batch.length);
 
           // After first response, log the learned capacity and recalculate
@@ -296,12 +284,10 @@ export async function publishRecords(
         if (isRateLimitError(e)) {
           onLog('warn', 'Rate limit hit -- waiting for quota reset...');
 
-          const rawErrHeaders: Record<string, string> =
-            typeof e?.response?.headers?.forEach === 'function'
-              ? (() => { const o: Record<string, string> = {}; e.response.headers.forEach((v: string, k: string) => { o[k] = v; }); return o; })()
-              : (e?.response?.headers ?? e?.headers ?? {});
+          // XrpcResponseError exposes the 429's headers (a WHATWG Headers
+          // instance) directly; normalizeHeaders understands that shape.
           rl.refund(batchPoints); // this reservation was never actually sent
-          rl.handleRateLimitHit(normalizeHeaders(rawErrHeaders));
+          rl.handleRateLimitHit(e?.headers ?? e?.response?.headers);
           await rl.waitForPermit(batchPoints, isCancelled);
           continue; // retry same batch
         }
